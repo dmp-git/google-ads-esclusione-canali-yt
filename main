@@ -1,4 +1,6 @@
 /*************************************************
+ * © Paolo Di Marco
+ *
  * Placement Exclusion (YouTube Channel) 
  * con sistema di caching in Foglio Google
  * e colonna 'Excluded' = "YES" anche se canale
