@@ -1,0 +1,369 @@
+/*************************************************
+ * Placement Exclusion (YouTube Channel) 
+ * con sistema di caching in Foglio Google
+ * e colonna 'Excluded' = "YES" anche se canale
+ * risulta già escluso in Ads.
+ *
+ * In più, filtra i posizionamenti che hanno
+ * generato almeno 1 click.
+ *************************************************/
+
+// ===================== CONFIGURAZIONE =====================
+
+// (1) Nome della lista di esclusione in Google Ads
+var EXCLUSION_LIST_NAME = 'esclusione placement';
+
+// (2) Parametri di caching (Foglio Google)
+// TEMPLATE DI RIFERIMENTO: https://docs.google.com/spreadsheets/d/1oxKdx5izqP4BS1QnzEZvBbTDn6oJ_VmrNLDETKvHC9I/edit?gid=0#gid=0
+var SPREADSHEET_URL = '';
+var SHEET_NAME = 'YouTubeChannelCache';
+var TTL_DAYS = 30; 
+
+// (3) Parametri dello script
+var CHUNK_SIZE = 50; // quanti canali per chiamata batch
+
+// Paesi consentiti (esempio con MC = Monaco)
+var ALLOWED_COUNTRIES = ['US','GB','IT','CA','AU','NZ','MC'];
+
+// ===================== VARIABILI GLOBALI =====================
+var channelCache = {}; // channelId -> { title, lang, country, lastCheck, excluded }
+
+/**
+ * Funzione che decide se escludere un canale:
+ *  - se Lang e Country sono entrambi vuoti => mantieni
+ *  - se Lang inizia con en/it e Country fuori whitelist => escludi
+ *  - se Lang è diverso da en/it => escludi
+ *  - se Lang è vuoto e Country fuori whitelist => escludi
+ */
+function shouldExcludeChannel(defaultLang, country) {
+  // Entrambi vuoti => mantieni
+  if (!defaultLang && !country) {
+    return false;
+  }
+  
+  if (defaultLang) {
+    var isEnOrIt = defaultLang.startsWith("en") || defaultLang.startsWith("it");
+    if (isEnOrIt) {
+      // Se c'è un country non incluso in ALLOWED_COUNTRIES => escludi
+      // Se country è vuoto => mantieni
+      if (country && ALLOWED_COUNTRIES.indexOf(country) === -1) {
+        return true; 
+      } else {
+        return false;
+      }
+    } else {
+      // Lang non inizia con en o it => escludi
+      return true;
+    }
+  } else {
+    // defaultLang vuoto, ma c'è un country
+    // Se country non è in ALLOWED_COUNTRIES => escludi
+    if (ALLOWED_COUNTRIES.indexOf(country) === -1) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+}
+
+/**
+ * Carica la cache esistente dal Foglio in memoria (channelCache).
+ * Schema colonne: A=ChannelID, B=Title, C=Lang, D=Country, E=LastCheck, F=Excluded
+ */
+function loadCache() {
+  var sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    throw new Error("La scheda '" + SHEET_NAME + "' non esiste nel foglio " + SPREADSHEET_URL);
+  }
+  var values = sheet.getDataRange().getValues();
+  
+  // Riga 1: intestazioni (ChannelID, Title, Lang, Country, LastCheck, Excluded)
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var channelId = row[0];
+    if (!channelId) continue; // salta righe vuote
+    
+    var title = row[1] || "";
+    var lang = row[2] || "";
+    var country = row[3] || "";
+    var lastCheck = row[4] ? new Date(row[4]) : new Date(0); 
+    var excludedValue = row[5] || "NO"; 
+    
+    channelCache[channelId] = {
+      title: title,
+      lang: lang,
+      country: country,
+      lastCheck: lastCheck,
+      excluded: excludedValue
+    };
+  }
+}
+
+/**
+ * Salva la cache aggiornata nel Foglio, riscrivendo completamente i dati.
+ */
+function saveCache() {
+  var sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+  sheet.clearContents();
+  
+  // intestazioni
+  sheet.getRange(1,1).setValue("ChannelID");
+  sheet.getRange(1,2).setValue("Title");
+  sheet.getRange(1,3).setValue("Lang");
+  sheet.getRange(1,4).setValue("Country");
+  sheet.getRange(1,5).setValue("LastCheck");
+  sheet.getRange(1,6).setValue("Excluded");
+  
+  var output = [];
+  for (var chId in channelCache) {
+    var data = channelCache[chId];
+    output.push([
+      chId,
+      data.title,
+      data.lang,
+      data.country,
+      data.lastCheck,
+      data.excluded || "NO"
+    ]);
+  }
+  
+  if (output.length > 0) {
+    sheet.getRange(2, 1, output.length, 6).setValues(output);
+  }
+}
+
+/**
+ * Verifica se la data di ultimo controllo è più vecchia di TTL_DAYS.
+ */
+function isStale(dateObj) {
+  if (!dateObj) return true; 
+  var diffMs = new Date() - dateObj; 
+  var diffDays = diffMs / (1000 * 60 * 60 * 24);
+  return diffDays > TTL_DAYS;
+}
+
+/**
+ * Richiama la YouTube Data API in batch (max 50 ID).
+ */
+function getChannelInfoBatch(channelIdString) {
+  try {
+    var response = YouTube.Channels.list('snippet,localizations', {
+      id: channelIdString,
+      maxResults: 50
+    });
+    return response;
+  } catch (err) {
+    Logger.log("Errore nella chiamata batch YouTube API: " + err.message);
+    return null;
+  }
+}
+
+function main() {
+  // 1) Carica la cache
+  loadCache();
+  Logger.log("Cache caricata. Contiene " + Object.keys(channelCache).length + " canali.");
+
+  // 2) Recupera o crea la lista di esclusione se non esiste
+  var listIter = AdsApp.excludedPlacementLists()
+    .withCondition("shared_set.name = '" + EXCLUSION_LIST_NAME + "'")
+    .get();
+  if(!listIter.hasNext()) {
+    AdsApp.newExcludedPlacementListBuilder()
+      .withName(EXCLUSION_LIST_NAME)
+      .build();
+  }
+  var list = AdsApp.excludedPlacementLists()
+    .withCondition("shared_set.name = '" + EXCLUSION_LIST_NAME + "'")
+    .get()
+    .next();
+  
+  // 3) Recupera i posizionamenti già presenti in Ads (già esclusi)
+  var existingPlacements = {};
+  var placementsIter = list.excludedPlacements().get();
+  while (placementsIter.hasNext()) {
+    var pl = placementsIter.next();
+    existingPlacements[pl.getUrl()] = true;
+  }
+
+  var queryExisting = [
+    'SELECT shared_set.id,',
+    'shared_criterion.youtube_channel.channel_id,',
+    'shared_criterion.placement.url ',
+    'FROM shared_criterion ',
+    'WHERE shared_set.id=' + list.getId()
+  ].join(' ');
+  var rowsExisting = AdsApp.report(queryExisting).rows();
+  while(rowsExisting.hasNext()) {
+    var row = rowsExisting.next();
+    if(row['shared_criterion.youtube_channel.channel_id']) {
+      existingPlacements['youtube.com/channel/' + row['shared_criterion.youtube_channel.channel_id']] = true;
+    }
+    if(row['shared_criterion.placement.url']) {
+      existingPlacements[row['shared_criterion.placement.url']] = true;
+    }
+  }
+
+  // 4) Leggi i posizionamenti YouTube attivi con almeno 1 click
+  var query = [
+    "SELECT detail_placement_view.display_name,",
+    "       detail_placement_view.group_placement_target_url,",
+    "       metrics.clicks ",
+    "FROM detail_placement_view ",
+    "WHERE detail_placement_view.placement_type IN ('YOUTUBE_VIDEO','YOUTUBE_CHANNEL') ",
+    "  AND detail_placement_view.group_placement_target_url IS NOT NULL ",
+    "  AND metrics.clicks > 0"
+    // "  AND segments.date DURING LAST_30_DAYS" // se vuoi un intervallo di date
+  ].join(' ');
+  
+  var result = AdsApp.search(query);
+
+  var channelsToCheck = [];
+  var seenChannelIds = {};
+
+  while (result.hasNext()) {
+    var row = result.next();
+    var url = row['detailPlacementView']['groupPlacementTargetUrl'];
+    if (!url) continue;
+    
+    var match = url.match(/^.*\/([^\/]*)$/);
+    if (match && match[1]) {
+      var channelId = match[1];
+      if (!seenChannelIds[channelId]) {
+        channelsToCheck.push({
+          id: channelId,
+          displayName: row['detailPlacementView']['displayName'] || ""
+        });
+        seenChannelIds[channelId] = true;
+      }
+    }
+  }
+  Logger.log("Trovati " + channelsToCheck.length + " canali (>=1 click) da analizzare.");
+
+  // 5) Separiamo i canali in (cache fresca) vs (da aggiornare)
+  var channelsToUpdate = [];
+  var finalChannelData = {};
+
+  for (var i = 0; i < channelsToCheck.length; i++) {
+    var chId = channelsToCheck[i].id;
+    var dispName = channelsToCheck[i].displayName;
+    var cached = channelCache[chId];
+    
+    if (cached) {
+      if (isStale(cached.lastCheck)) {
+        channelsToUpdate.push(chId);
+      } else {
+        finalChannelData[chId] = {
+          title: cached.title || dispName,
+          lang: cached.lang,
+          country: cached.country,
+          lastCheck: cached.lastCheck,
+          excluded: cached.excluded || "NO"
+        };
+      }
+    } else {
+      channelsToUpdate.push(chId);
+    }
+  }
+
+  Logger.log("Canali da aggiornare con YouTube API: " + channelsToUpdate.length);
+
+  // 6) Aggiorniamo i canali scaduti/nuovi in batch
+  for (var startIdx = 0; startIdx < channelsToUpdate.length; startIdx += CHUNK_SIZE) {
+    var batchIds = channelsToUpdate.slice(startIdx, startIdx + CHUNK_SIZE);
+    var batchIdString = batchIds.join(',');
+    
+    var response = getChannelInfoBatch(batchIdString);
+    if (!response || !response.items) continue;
+    
+    for (var j = 0; j < response.items.length; j++) {
+      var channel = response.items[j];
+      var channelId = channel.id;
+      var defaultLang = (channel.snippet.defaultLanguage || "").toLowerCase();
+      var country = (channel.snippet.country || "").toUpperCase();
+      var title = channel.snippet.title || "";
+      
+      finalChannelData[channelId] = {
+        title: title,
+        lang: defaultLang,
+        country: country,
+        lastCheck: new Date(),
+        excluded: "NO"
+      };
+    }
+  }
+
+  // Fallback per canali non trovati
+  for (var i2 = 0; i2 < channelsToUpdate.length; i2++) {
+    var missing = channelsToUpdate[i2];
+    if (!finalChannelData[missing]) {
+      finalChannelData[missing] = {
+        title: "N/A (not found)",
+        lang: "",
+        country: "",
+        lastCheck: new Date(),
+        excluded: "NO"
+      };
+    }
+  }
+
+  // 7) Aggiorniamo la channelCache in memoria
+  for (var id2 in finalChannelData) {
+    channelCache[id2] = {
+      title: finalChannelData[id2].title,
+      lang: finalChannelData[id2].lang,
+      country: finalChannelData[id2].country,
+      lastCheck: finalChannelData[id2].lastCheck,
+      excluded: finalChannelData[id2].excluded
+    };
+  }
+
+  // 8) Decidiamo chi escludere
+  var toAdd = [];
+  for (var id3 in finalChannelData) {
+    var data = finalChannelData[id3];
+    var placementUrl = 'youtube.com/channel/' + id3;
+
+    // Se è già escluso in Ads, MARCHIAMO "YES" e saltiamo
+    var logBase = "Canale: [" + data.title + "] (ID: " + id3 + "), " +
+                  "Lang: " + data.lang + ", Country: " + data.country + " => ";
+    
+    if (existingPlacements[placementUrl]) {
+      data.excluded = "YES";
+      Logger.log(logBase + "GIÀ ESCLUSO (in Ads)");
+      continue;
+    }
+    
+    // Altrimenti, decido con shouldExcludeChannel
+    var exclude = shouldExcludeChannel(data.lang, data.country);
+    if (exclude) {
+      data.excluded = "YES";
+      toAdd.push(placementUrl);
+      existingPlacements[placementUrl] = true;
+      Logger.log(logBase + "ESCLUSO");
+    } else {
+      data.excluded = "NO";
+      Logger.log(logBase + "MANTENUTO");
+    }
+  }
+
+  // 9) Aggiungere i nuovi canali esclusi in Bulk Upload
+  if (toAdd.length > 0) {
+    var columnHeads = ['Action', 'Placement Exclusion List Name', 'Placement url'];
+    var upload = AdWordsApp.bulkUploads().newCsvUpload(columnHeads, { moneyInMicros: false });
+    for (var z = 0; z < toAdd.length; z++) {
+      upload.append({
+        'Action': 'Add', 
+        'Placement Exclusion List Name': EXCLUSION_LIST_NAME, 
+        'Placement url': toAdd[z]
+      });
+    }
+    upload.apply();
+    Logger.log('Aggiunti ' + toAdd.length + ' canali alla lista "' + EXCLUSION_LIST_NAME + '".');
+  } else {
+    Logger.log('Nessun nuovo canale da aggiungere alla lista di esclusione.');
+  }
+
+  // 10) Salviamo la cache aggiornata
+  saveCache();
+  Logger.log("Cache aggiornata e salvata. Fine script.");
+}
